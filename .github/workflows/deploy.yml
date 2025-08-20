@@ -1,21 +1,30 @@
- on:
-   push:
-     branches:
-       - main
+on:
+  push:
+    branches:
+      - main
 
- env:
-   FREESTYLE_API_KEY: ${{ secrets.FREESTYLE_API_KEY }}
+env:
+  FREESTYLE_API_KEY: ${{ secrets.FREESTYLE_API_KEY }}
+  DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
- jobs:
-   deploy:
-     name: Deploy
-     runs-on: ubuntu-latest
-     steps:
-       - uses: actions/checkout@v2
-       - uses: actions/setup-node@v1
-         with:
-           node-version: "22"
-       - run: |
-           npx freestyle-sh deploy \
-             --build \
-             --domain=adorable.dev
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Drizzle push
+        run: npx drizzle-kit push
+
+      - name: Deploy
+        run: |
+          npx freestyle-sh deploy \
+            --build \
+            --domain=adorable.dev
