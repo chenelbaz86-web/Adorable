@@ -5,6 +5,9 @@ import { Memory } from "@mastra/memory";
 import { PostgresStore, PgVector } from "@mastra/pg";
 import { todoTool } from "@/tools/todo-tool";
 
+// תקרת פלט שמרנית כדי לא לבזבז OTPM
+const MAX_OUTPUT_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS || 800);
+
 export const memory = new Memory({
   options: {
     lastMessages: 1000,
@@ -24,7 +27,8 @@ export const memory = new Memory({
 
 export const builderAgent = new Agent({
   name: "BuilderAgent",
-  model: anthropic("claude-3-7-sonnet-20250219"),
+  model: anthropic("claude-3-5-haiku-latest"),
+    maxTokens: MAX_OUTPUT_TOKENS,
   instructions: SYSTEM_MESSAGE,
   memory,
   tools: {
