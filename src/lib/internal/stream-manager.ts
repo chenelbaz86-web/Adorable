@@ -1,3 +1,5 @@
+// src/lib/internal/stream-manager.ts
+
 import { UIMessage } from "ai";
 import { after } from "next/server";
 import { createResumableStreamContext } from "resumable-stream";
@@ -5,6 +7,99 @@ import { redis, redisPublisher } from "./redis";
 import { AIService } from "./ai-service";
 import { Agent } from "@mastra/core/agent";
 import { FreestyleDevServerFilesystem } from "freestyle-sandboxes";
+import Bottleneck from "bottleneck";
+
+// ================================
+// Rate Limit Guard (ITPM Budget + Queue + Retry)
+// ================================
+
+// אומדן גס: ~טוקן לכל 4 תווים
+function estimateTokens(str: string) {
+  return Math.ceil((str?.length || 0) / 4);
+}
+
+// מפה של ITPM לפי מודל (ניתן להרחיב/לעדכן לפי המסמכים של Anthropic)
+const MODEL_ITPM: Record<string, number> = {
+  "claude-3-5-haiku-latest": 50_000,
+  "claude-3-5-sonnet-latest": 20_000,
+  "claude-4-sonnet-20250514": 30_000,
+};
+
+// המודל הנוכחי לקביעת התקציב לדקה (לא מחליף את בחירת המודל ב-agent,
+// רק משמש לניהול ה-ITPM Budget כאן)
+const CURRENT_MODEL =
+  process.env.ANTHROPIC_MODEL || "claude-3-5-haiku-latest";
+
+const ITPM_LIMIT = MODEL_ITPM[CURRENT_MODEL] ?? 20_000;
+
+// לעבוד מעט מתחת לתקרה כדי לא להתנגש בבורסטים
+const SAFETY = 0.9;
+const ITPM_BUDGET = Math.floor(ITPM_LIMIT * SAFETY);
+
+// חלון דקה
+let minuteStart = Date.now();
+let usedThisMinute = 0;
+
+function resetWindowIfNeeded() {
+  const now = Date.now();
+  if (now - minuteStart >= 60_000) {
+    minuteStart = now;
+    usedThisMinute = 0;
+  }
+}
+
+async function waitForBudget(need: number) {
+  for (;;) {
+    resetWindowIfNeeded();
+    if (usedThisMinute + need <= ITPM_BUDGET) {
+      usedThisMinute += need;
+      return;
+    }
+    const msLeft = 60_000 - (Date.now() - minuteStart);
+    await new Promise((r) => setTimeout(r, Math.max(msLeft, 200)));
+  }
+}
+
+// תור מרכזי למנוע בורסטים של בקשות במקביל
+const limiter = new Bottleneck({
+  minTime: 80, // רווח מינימלי בין בקשות
+  reservoir: 1000, // מצמצם בורסטים; ניתן לכוונן
+  reservoirRefreshInterval: 60_000,
+  reservoirRefreshAmount: 1000,
+});
+
+// ריטריי חכם על 429 + כיבוד Retry-After אם קיים
+async function withRetry<T>(fn: () => Promise<T>) {
+  let delay = 400;
+  for (let i = 0; i < 5; i++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      const status = err?.statusCode || err?.status;
+      const is429 =
+        status === 429 ||
+        /rate[_\s-]?limit/i.test(String(err?.message ?? err));
+
+      if (!is429 || i === 4) throw err;
+
+      const retryAfterHeader =
+        err?.responseHeaders?.["retry-after"] ??
+        err?.response?.headers?.["retry-after"];
+      const retryAfterMs = Number(retryAfterHeader) * 1000;
+
+      const waitMs =
+        !Number.isNaN(retryAfterMs) && retryAfterMs > 0 ? retryAfterMs : delay;
+
+      await new Promise((r) => setTimeout(r, waitMs));
+      delay = Math.min(delay * 2, 8000);
+    }
+  }
+  throw new Error("unreachable");
+}
+
+// ================================
+// Resumable stream infra (כמו שהיה)
+// ================================
 
 const streamContext = createResumableStreamContext({
   waitUntil: after,
@@ -218,7 +313,7 @@ export async function handleStreamLifecycle(
 
 /**
  * Send a message to the AI and handle all stream plumbing internally
- * This is the main interface that developers should use
+ * Main entry point used by the API routes
  */
 export async function sendMessageWithStreaming(
   agent: Agent,
@@ -237,48 +332,54 @@ export async function sendMessageWithStreaming(
 
   let lastKeepAlive = Date.now();
 
-  // Use the AI service to handle the AI interaction
-  const aiResponse = await AIService.sendMessage(
-    agent,
-    appId,
-    mcpUrl,
-    fs,
-    message,
-    {
-      threadId: appId,
-      resourceId: appId,
-      maxSteps: 100,
-      maxRetries: 0,
-      maxOutputTokens: 64000,
-      async onChunk() {
-        if (Date.now() - lastKeepAlive > 5000) {
-          lastKeepAlive = Date.now();
-          await updateKeepAlive(appId);
-        }
-      },
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      async onStepFinish(_step: { response: { messages: unknown[] } }) {
-        if (shouldAbort) {
-          await handleStreamLifecycle(appId, "error");
-          controller.abort("Aborted stream after step finish");
-          const messages = await AIService.getUnsavedMessages(appId);
-          console.log(messages);
-          await AIService.saveMessagesToMemory(agent, appId, messages);
-        }
-      },
-      onError: async (error: { error: unknown }) => {
-        console.error("Stream error in manager:", error);
-        await handleStreamLifecycle(appId, "error");
-      },
-      onFinish: async () => {
-        await handleStreamLifecycle(appId, "finish");
-      },
-      abortSignal: controller.signal,
-    }
+  // נחשב אומדן לקלט כדי לא לחצות ITPM
+  const estimatedInput = estimateTokens(
+    typeof message?.content === "string"
+      ? message.content
+      : JSON.stringify(message ?? {})
   );
 
-  // Ensure the stream has the proper method
-  if (!aiResponse.stream.toUIMessageStreamResponse) {
+  // נמתין לתקציב לדקה במידת הצורך
+  await waitForBudget(estimatedInput);
+
+  // הפעלה עם תור + ריטריי + הקטנת פלט
+  const aiResponse = await limiter.schedule(() =>
+    withRetry(() =>
+      AIService.sendMessage(agent, appId, mcpUrl, fs, message, {
+        threadId: appId,
+        resourceId: appId,
+        maxSteps: 100,
+        maxRetries: 0,
+        // תקרת פלט (OTPM) נשלטת ע"י ENV; ברירת מחדל 800
+        maxOutputTokens: Number(process.env.MAX_OUTPUT_TOKENS || 800),
+        async onChunk() {
+          if (Date.now() - lastKeepAlive > 5000) {
+            lastKeepAlive = Date.now();
+            await updateKeepAlive(appId);
+          }
+        },
+        async onStepFinish(_step: { response: { messages: unknown[] } }) {
+          if (shouldAbort) {
+            await handleStreamLifecycle(appId, "error");
+            controller.abort("Aborted stream after step finish");
+            const messages = await AIService.getUnsavedMessages(appId);
+            console.log(messages);
+            await AIService.saveMessagesToMemory(agent, appId, messages);
+          }
+        },
+        onError: async (error: { error: unknown }) => {
+          console.error("Stream error in manager:", error);
+          await handleStreamLifecycle(appId, "error");
+        },
+        onFinish: async () => {
+          await handleStreamLifecycle(appId, "finish");
+        },
+        abortSignal: controller.signal,
+      })
+    )
+  );
+
+  if (!aiResponse.stream?.toUIMessageStreamResponse) {
     console.error("Stream missing toUIMessageStreamResponse method!");
     throw new Error(
       "Invalid stream format - missing toUIMessageStreamResponse method"
